@@ -71,6 +71,7 @@ Acceptance checks:
 Implementation note:
 
 - Updated `PUT /mirror` to parse the request body defensively, require a SHA-256 in the mirror URL, pre-authorize the auth `x` tag against that URL hash before downloading, compute the SHA-256 of downloaded bytes, reject content mismatches with `409`, and import only after the actual bytes match the pre-authorized hash.
+- Added mirror SSRF guardrails before fetching: mirror URLs must parse as `https`, must have a resolvable non-private/non-loopback/non-link-local host, crafted hostnames that spoof Primal direct-fetch substrings are rejected, and the SHA-256 is extracted from the parsed URL path instead of the raw URL string.
 - Consolidated `x` tag validation through `check_x_tag` so `check_action(...; x_tag_hash=...)` and mirror validation use the same tag matching behavior.
 - Full load verification was attempted with `nix --extra-experimental-features 'nix-command flakes' develop -c julia --project -e 'import PrimalServer'`, but the environment failed before import because `bech32/ref/c/segwit_addr.c` is missing and Julia could not resolve `TimeZones`.
 
@@ -112,6 +113,11 @@ Acceptance checks:
 - Future `created_at` returns `401`.
 - Valid server-scoped token for this host succeeds.
 - Valid server-scoped token for another host fails.
+
+Implementation note:
+
+- Updated `check_action` to decode `Authorization: Nostr` tokens as base64url, with padded base64url and legacy standard base64 accepted for backward compatibility. Malformed token input now maps to `401`; auth validation requires kind `24242`, valid event id/signature, non-future `created_at`, at least one future `expiration` tag, matching `t` tags, valid and matching `server` tag domain scope, and exact lowercase hex `x` tag matches when a hash is required.
+- Full load verification remains blocked by local environment setup: `nix --extra-experimental-features 'nix-command flakes' develop -c julia --project -e 'import PrimalServer'` fails before import because `bech32/ref/c/segwit_addr.c` is missing and Julia cannot resolve `TimeZones`.
 
 ### 3. `X-SHA-256` Mismatch Is Not Enforced On Upload Or Media
 
@@ -167,6 +173,10 @@ Acceptance checks:
 - `DELETE /<missing-sha256>` returns `404` without internal exception.
 - Deleting an existing blob with invalid auth returns `401`.
 - Deleting another user's blob returns `404` or `403`, depending on desired policy.
+
+Implementation note:
+
+- `DELETE` now returns `404` immediately when `find_upload` returns `nothing`, before reading `r.sha256`, and the leftover `@show` debug print was removed from the purge path.
 
 ### 5. `/media` Uses Upload Auth Action Instead Of Media Auth Action
 
@@ -303,6 +313,10 @@ Acceptance checks:
 - Intentional lookup behavior is documented in code or tests.
 - No unreachable code remains.
 - Moderation/blocking semantics are preserved.
+
+Implementation note:
+
+- Removed the unreachable `media_storage` fallback after the early `find_upload` return. Current runtime behavior remains limited to upload-backed blobs.
 
 ### 10. Missing Focused Regression Tests
 

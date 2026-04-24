@@ -1,6 +1,6 @@
 module Blossom
 
-import HTTP, JSON, URIs, Base64, SHA
+import HTTP, JSON, URIs, Base64, SHA, Sockets
 using DataStructures: CircularBuffer
 
 import ..Utils
@@ -100,31 +100,7 @@ function get_header(headers, header)
 end
 
 function find_blob(req_target)
-    r = find_upload(req_target)
-    return r # !!
-    isnothing(r) || return r
-
-    h, ext = splitext(req_target[2:end])
-    h = lowercase(h)
-    sha256 = hex2bytes(h)
-    for (media_url, mimetype, size, storage_provider) in pex(:p0, "
-                                                       select ms.media_url, ms.content_type, ms.size, ms.storage_provider 
-                                                       from media_storage ms
-                                                       where 
-                                                         ms.sha256 = ?1 and ms.media_block_id is null and
-                                                         not exists (
-                                                           select 1 from media_uploads mu, media_block mb 
-                                                           where 
-                                                             ms.sha256 = mu.sha256 and mu.media_block_id = mb.id and
-                                                             mb.d->>'reason' like 'csam%'
-                                                           limit 1
-                                                         )
-                                                       limit 1", 
-                                                       [sha256])[2]
-        storage_provider = Symbol(storage_provider)
-        return (; media_url, storage_provider, mimetype, size, sha256)
-    end
-    nothing
+    find_upload(req_target)
 end
 
 function find_upload(req_target)
@@ -157,42 +133,169 @@ function find_upload(req_target)
     nothing
 end
 
+function base64url_decode_nopad(s::AbstractString)
+    if !isnothing(match(r"^[A-Za-z0-9_-]+=*$", s))
+        stripped = replace(String(s), r"=+$" => "")
+        mod4 = length(stripped) % 4
+        mod4 == 1 && blossom_error(401, "invalid auth event")
+        padded = replace(replace(stripped, '-'=>'+'), '_'=>'/') * repeat("=", mod(4 - mod4, 4))
+        try
+            return Base64.base64decode(padded)
+        catch _
+        end
+    end
+    try
+        Base64.base64decode(s)
+    catch _
+        blossom_error(401, "invalid auth event")
+    end
+end
+
+function is_valid_server_domain(domain::AbstractString)
+    !isnothing(match(r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", domain))
+end
+
+function host_domain(host)
+    isnothing(host) && return nothing
+    host = lowercase(strip(String(host)))
+    isempty(host) && return nothing
+    if startswith(host, '[')
+        return nothing
+    end
+    domain = split(host, ':'; limit=2)[1]
+    is_valid_server_domain(domain) ? domain : nothing
+end
+
+function base_url_domain()
+    try
+        host_domain(URIs.parse_uri(BASE_URL[]).host)
+    catch _
+        nothing
+    end
+end
+
+function current_server_domains(req)
+    domains = Set{String}()
+    # Accept either proxy-forwarded Host or configured public BASE_URL for scoped tokens.
+    for domain in (host_domain(get_header(req.headers, "Host")), base_url_domain())
+        isnothing(domain) || push!(domains, domain)
+    end
+    domains
+end
+
+function ipv4_octets(ip::AbstractString)
+    parts = split(String(ip), '.')
+    length(parts) == 4 || return nothing
+    octets = Int[]
+    for part in parts
+        isempty(part) && return nothing
+        octet = try parse(Int, part) catch _ return nothing end
+        0 <= octet <= 255 || return nothing
+        push!(octets, octet)
+    end
+    octets
+end
+
+function is_blocked_ipv4(ip::AbstractString)
+    octets = ipv4_octets(ip)
+    isnothing(octets) && return false
+    a, b = octets[1], octets[2]
+    a == 0 || a == 10 || a == 127 ||
+    (a == 100 && 64 <= b <= 127) ||
+    (a == 169 && b == 254) ||
+    (a == 172 && 16 <= b <= 31) ||
+    (a == 192 && b == 168) ||
+    (a == 198 && 18 <= b <= 19) ||
+    a >= 224
+end
+
+function is_blocked_ipv6(ip::AbstractString)
+    s = lowercase(String(ip))
+    s == "::" || s == "::1" || startswith(s, "fe80:") || startswith(s, "fc") || startswith(s, "fd")
+end
+
+function is_blocked_mirror_ip(ip)
+    s = string(ip)
+    is_blocked_ipv4(s) || occursin(':', s) && is_blocked_ipv6(s)
+end
+
+function has_spoofed_primal_direct_host(host::AbstractString)
+    for direct_host in ("primal.net", "primalnode.net", "primaldata.s3", "primaldata.fsn1")
+        if occursin(direct_host, host) && !(host == direct_host || endswith(host, ".$direct_host"))
+            return true
+        end
+    end
+    false
+end
+
+function validate_mirror_url(url::String)
+    u = try URIs.parse_uri(url) catch _ blossom_error(400, "invalid mirror URL") end
+    scheme = isnothing(u.scheme) ? "" : lowercase(String(u.scheme))
+    scheme == "https" || blossom_error(400, "invalid mirror URL scheme")
+    host = host_domain(u.host)
+    isnothing(host) && blossom_error(400, "invalid mirror URL host")
+    has_spoofed_primal_direct_host(host) && blossom_error(400, "invalid mirror URL host")
+    ips = try Sockets.getalladdrinfo(host) catch _ blossom_error(400, "invalid mirror URL host") end
+    isempty(ips) && blossom_error(400, "invalid mirror URL host")
+    any(is_blocked_mirror_ip, ips) && blossom_error(400, "invalid mirror URL host")
+    path = isnothing(u.path) ? "" : String(u.path)
+    m = match(r"/(?:[^/?#]*/)*([0-9a-fA-F]{64})(?:\.[^/?#]*)?$", path)
+    isnothing(m) && blossom_error(400, "mirror URL missing sha256")
+    lowercase(m[1]), string(u)
+end
+
 function check_action(req, action::String; x_tag_hash=nothing)
     parts = []
     if !isnothing(local v = get_header(req.headers, "Authorization"))
         parts = split(v)
     end
-    length(parts) == 2 || blossom_error(400, "missing auth event")
-    parts[1] == "Nostr" || blossom_error(400, "invalid auth event")
-    e = Nostr.Event(JSON.parse(String(Base64.base64decode(parts[2]))))
-    Nostr.verify(e) || blossom_error(400, "auth event verification failed")
-    e.kind == 24242 || blossom_error(400, "wrong kind in auth event")
-    # @assert e.created_at <= trunc(Int, time())
+    length(parts) == 2 || blossom_error(401, "missing auth event")
+    parts[1] == "Nostr" || blossom_error(401, "invalid auth event")
+    e = try
+        Nostr.Event(JSON.parse(String(base64url_decode_nopad(parts[2]))))
+    catch ex
+        ex isa BlossomException && rethrow()
+        blossom_error(401, "invalid auth event")
+    end
+    Nostr.verify(e) || blossom_error(401, "auth event verification failed")
+    e.kind == 24242 || blossom_error(401, "wrong kind in auth event")
+    now = trunc(Int, time())
+    e.created_at <= now || blossom_error(401, "auth event created in the future")
     action_ok = false
+    expiration_ok = false
+    server_tags = String[]
     for t in e.tags
         if length(t.fields) >= 2
             if t.fields[1] == "expiration"
-                expiration = parse(Int, t.fields[2])
-                expiration > trunc(Int, time()) || blossom_error(400, "auth event expired")
+                expiration = try parse(Int, t.fields[2]) catch _ blossom_error(401, "invalid expiration tag") end
+                expiration_ok |= expiration > now
             elseif t.fields[1] == "t"
                 action_ok |= action == t.fields[2] 
+            elseif t.fields[1] == "server"
+                t.fields[2] isa AbstractString || blossom_error(401, "invalid server tag")
+                server = lowercase(String(t.fields[2]))
+                is_valid_server_domain(server) || blossom_error(401, "invalid server tag")
+                push!(server_tags, server)
             end
         end
     end
-    action_ok || blossom_error(400, "invalid action in auth event")
+    expiration_ok || blossom_error(401, "auth event expired")
+    action_ok || blossom_error(401, "invalid action in auth event")
+    if !isempty(server_tags)
+        domains = current_server_domains(req)
+        any(server -> server in domains, server_tags) || blossom_error(401, "invalid server tag")
+    end
     if !isnothing(x_tag_hash)
         check_x_tag(e, x_tag_hash)
     end
     e
 end
 
-function check_x_tag(e::Nostr.Event, x_tag_hash; status=400)
+function check_x_tag(e::Nostr.Event, x_tag_hash; status=401)
+    expected = bytes2hex(x_tag_hash)
     for t in e.tags
         if length(t.fields) >= 2 && t.fields[1] == "x"
-            try
-                hex2bytes(t.fields[2]) == x_tag_hash && return nothing
-            catch _
-            end
+            t.fields[2] == expected && return nothing
         end
     end
     blossom_error(status, "invalid x tag")
@@ -261,9 +364,10 @@ function blossom_handler(req::HTTP.Request)
 
         elseif req.method == "DELETE"
             r = find_upload(req.target)
+            isnothing(r) && blossom_error(404, "not found")
             e = check_action(req, "delete"; x_tag_hash=r.sha256)
             if !isnothing(r) && r.pubkey == e.pubkey
-                @show Main.InternalServices.purge_media_(e.pubkey, r.media_url; reason="delete from blossom", extra=(; initiator_pubkey=e.pubkey))
+                Main.InternalServices.purge_media_(e.pubkey, r.media_url; reason="delete from blossom", extra=(; initiator_pubkey=e.pubkey))
                 return HTTP.Response(200, response_headers("text/plain"), "ok")
             else
                 blossom_error(404, "not found")
@@ -282,9 +386,8 @@ function blossom_handler(req::HTTP.Request)
                     ex isa BlossomException && rethrow()
                     blossom_error(400, "invalid mirror request")
                 end
-                m = match(r"/([0-9a-fA-F]{64})", url)
-                isnothing(m) && blossom_error(400, "mirror URL missing sha256")
-                h = hex2bytes(m[1])
+                hash_hex, url = validate_mirror_url(url)
+                h = hex2bytes(hash_hex)
                 e = check_action(req, "upload"; x_tag_hash=h)
                 data = try
                     Media.download(est[], url; timeout=300)
