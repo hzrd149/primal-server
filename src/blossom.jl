@@ -169,7 +169,6 @@ function check_action(req, action::String; x_tag_hash=nothing)
     e.kind == 24242 || blossom_error(400, "wrong kind in auth event")
     # @assert e.created_at <= trunc(Int, time())
     action_ok = false
-    x_tag_ok = isnothing(x_tag_hash)
     for t in e.tags
         if length(t.fields) >= 2
             if t.fields[1] == "expiration"
@@ -177,14 +176,26 @@ function check_action(req, action::String; x_tag_hash=nothing)
                 expiration > trunc(Int, time()) || blossom_error(400, "auth event expired")
             elseif t.fields[1] == "t"
                 action_ok |= action == t.fields[2] 
-            elseif t.fields[1] == "x" && !isnothing(x_tag_hash)
-                x_tag_ok |= hex2bytes(t.fields[2]) == x_tag_hash
             end
         end
     end
     action_ok || blossom_error(400, "invalid action in auth event")
-    x_tag_ok || blossom_error(400, "invalid x tag")
+    if !isnothing(x_tag_hash)
+        check_x_tag(e, x_tag_hash)
+    end
     e
+end
+
+function check_x_tag(e::Nostr.Event, x_tag_hash; status=400)
+    for t in e.tags
+        if length(t.fields) >= 2 && t.fields[1] == "x"
+            try
+                hex2bytes(t.fields[2]) == x_tag_hash && return nothing
+            catch _
+            end
+        end
+    end
+    blossom_error(status, "invalid x tag")
 end
 
 function blossom_handler(req::HTTP.Request)
@@ -261,10 +272,26 @@ function blossom_handler(req::HTTP.Request)
         elseif req.method == "PUT"
             # push!(Main.stuff, (:blossomupload, req))
             if req.target == "/mirror"
-                url = JSON.parse(String(req.body))["url"]
-                h = hex2bytes(match(r"/([0-9a-fA-F]{64})", url)[1])
+                url = try
+                    body = JSON.parse(String(req.body))
+                    body isa Dict || blossom_error(400, "invalid mirror request")
+                    u = get(body, "url", nothing)
+                    u isa String || blossom_error(400, "invalid mirror request")
+                    u
+                catch ex
+                    ex isa BlossomException && rethrow()
+                    blossom_error(400, "invalid mirror request")
+                end
+                m = match(r"/([0-9a-fA-F]{64})", url)
+                isnothing(m) && blossom_error(400, "mirror URL missing sha256")
+                h = hex2bytes(m[1])
                 e = check_action(req, "upload"; x_tag_hash=h)
-                data = Media.download(est[], url; timeout=300)
+                data = try
+                    Media.download(est[], url; timeout=300)
+                catch _
+                    blossom_error(502, "failed to fetch mirror URL")
+                end
+                SHA.sha256(data) == h || blossom_error(409, "x tag does not match mirrored content")
                 return import_blob(e, data; strip_metadata=false)
             else
                 data = collect(req.body)
